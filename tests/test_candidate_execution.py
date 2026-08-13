@@ -193,6 +193,16 @@ def test_candidate_calls_only_real_allowed_mcp_tools_and_finishes():
     assert receipt["tool_call_attempts"] == 1
     assert receipt["llm_inference_cost_usd"] == 0.02
     assert receipt["paid_media_credits"] == 0.0
+    assert receipt["schema_version"] == "aivideo-bench-candidate-execution-v2"
+    assert receipt["token_usage"] == {
+        "input_tokens": 20,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "output_tokens": 10,
+    }
+    assert receipt["tool_metrics"][0]["name"] == "place_clips"
+    assert receipt["tool_metrics"][0]["successes"] == 1
+    assert receipt["first_model_response_seconds"] is not None
     assert client.calls == [
         ("place_clips", {"project_id": "project-1", "clips": []})
     ]
@@ -288,6 +298,18 @@ def test_schema_error_is_model_visible_and_can_be_repaired():
     assert receipt["status"] == "completed"
     assert receipt["tool_call_attempts"] == 2
     assert receipt["mcp_tool_calls"] == 1
+    assert receipt["tool_metrics"] == [
+        {
+            "name": "place_clips",
+            "attempts": 2,
+            "dispatched": 1,
+            "successes": 1,
+            "errors": 0,
+            "invalid_arguments": 1,
+            "recovered_errors": 1,
+            "latency_seconds": receipt["tool_metrics"][0]["latency_seconds"],
+        }
+    ]
     assert "invalid_tool_arguments" in completion.payloads[1]["messages"][-1]["content"]
 
 
