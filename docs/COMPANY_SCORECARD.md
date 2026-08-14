@@ -10,7 +10,8 @@ into a number nobody can audit:
 3. **What does it cost?** It reports total inference cost, cost per trial, cost
    per operational success, inference calls, and decomposed token usage.
 4. **How does it use tools?** It reports per-tool dispatch success, invalid
-   arguments, redundant calls, latency, and recovery after errors.
+   arguments, redundant calls, latency, and later same-tool successes after
+   errors.
 5. **Does it help the business?** It accepts denominator-backed production,
    billing, support, sales, audit, and experiment observations with an explicit
    claim level.
@@ -43,12 +44,20 @@ stable ID, decision question, unit, direction, and expected source.
 ## Candidate input
 
 Each private candidate JSON uses
-`aivideo-bench-company-candidate-v1` and contains:
+`aivideo-bench-company-candidate-v2` and contains:
 
-- `model` and `provider`;
+- an owner-HMAC-authenticated manifest binding derived model/provider identity,
+  candidate configuration, public standard, task pack, MCP surface,
+  prompt/verifier policies, calibration evidence, and matrix hashes;
 - the complete 300-row verifier result matrix accepted by `aivideo-bench report`;
 - a complete 300-row runtime matrix for latency, token, tool, and incident data;
+- 300 result-to-receipt bindings proving quality and runtime came from the same
+  task/trial executions;
 - zero or more aggregate business observations.
+
+Every runtime row requires a complete verifier annotation record, verifier
+policy version, evidence hash, receipt hash, and execution identities. Missing
+review cannot be represented as a zero incident rate.
 
 Business observations contain only aggregates:
 
@@ -60,7 +69,12 @@ Business observations contain only aggregates:
   "denominator": 100,
   "window": "2026-07-01/2026-07-31",
   "claim_level": "observed",
-  "source": "production_telemetry"
+  "source": "production_telemetry",
+  "evidence": {
+    "cohort_id": "paid-agent-users-july",
+    "query_sha256": "<sha256>",
+    "exposure_identity_sha256": "<candidate-config-sha256>"
+  }
 }
 ```
 
@@ -70,6 +84,7 @@ IDs, prompts, or raw model runs in this public repository.
 ## Compare candidates
 
 ```bash
+export AIVIDEO_BENCH_MANIFEST_SIGNING_KEY="..."
 aivideo-bench company-report \
   --candidate /secure/runs/luna.json \
   --candidate /secure/runs/terra.json \
@@ -82,13 +97,26 @@ latency, total inference cost, cost per usable success, tool success, and human
 intervention. It then expands reliability incidents, per-tool performance, and
 every registered business question with its denominator and claim level.
 
+The report emits an official score only when all 300 cells, receipt bindings,
+verifier evidence, cost-preflight feasibility, measured cost-cap and
+zero-paid-media checks, manifest HMAC, and the versioned calibration gate pass.
+A preflight-blocked task spends nothing but still fails the economic gate.
+Otherwise the report shows diagnostic quality only.
+
+Same-model MCP contribution uses unique variant IDs inside an authenticated
+ablation group. The standard and ablation variants must share the candidate
+configuration, task-pack identity, prompt/verifier policies, calibration
+evidence, and task cells; only their sealed pack/tool surface may differ.
+
 ## Claim levels
 
-- `observed`: a defined production cohort and time window were measured.
-- `directional`: a comparable cohort or before/after reference exists, but the
-  result may still be confounded.
-- `causal`: a randomized experiment or an equivalent defensible design supports
-  attribution.
+- `observed`: a defined cohort, query, exposure identity, and window were
+  measured using the registry-authorized source.
+- `directional`: the observed evidence plus comparator numerator, denominator,
+  window, and query identity exist, but the result may still be confounded.
+- `causal`: experiment identity, assignment unit, treatment/control counts,
+  treatment/control exposure identities, authenticated analysis artifact,
+  effect confidence interval, and analysis-policy version support attribution.
 
 The report never upgrades these claims automatically. A good benchmark score
 does not prove revenue or retention impact.

@@ -101,6 +101,10 @@ def _parser() -> argparse.ArgumentParser:
     company_command.add_argument(
         "--format", choices=("markdown", "json"), default="markdown"
     )
+    company_command.add_argument(
+        "--manifest-signing-key-env",
+        default="AIVIDEO_BENCH_MANIFEST_SIGNING_KEY",
+    )
     company_command.add_argument("--output", type=Path)
 
     metrics_command = commands.add_parser(
@@ -153,7 +157,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 _write(render_markdown(summary), args.output)
         elif args.command == "company-report":
-            report = build_company_report([_read_json(path) for path in args.candidate])
+            manifest_key = os.environ.get(args.manifest_signing_key_env)
+            if manifest_key is None:
+                raise ValueError(
+                    "manifest signing key environment variable is unset: "
+                    f"{args.manifest_signing_key_env}"
+                )
+            report = build_company_report(
+                [_read_json(path) for path in args.candidate],
+                manifest_signing_key=manifest_key.encode(),
+            )
             if args.format == "json":
                 _write_json(report, args.output)
             else:

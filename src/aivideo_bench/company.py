@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import hmac
 from collections import defaultdict
 from statistics import mean
 from typing import Any, Mapping, Sequence
 
 from .results import summarize_results
-from .standard import standard
+from .standard import canonical_bytes, sha256, standard
 
 
-COMPANY_INPUT_SCHEMA_VERSION = "aivideo-bench-company-candidate-v1"
-COMPANY_REPORT_SCHEMA_VERSION = "aivideo-bench-company-report-v1"
+COMPANY_INPUT_SCHEMA_VERSION = "aivideo-bench-company-candidate-v2"
+COMPANY_REPORT_SCHEMA_VERSION = "aivideo-bench-company-report-v2"
+RUN_MANIFEST_SCHEMA_VERSION = "aivideo-bench-run-manifest-v1"
+CLOCK_TOLERANCE_SECONDS = 0.00001
 CLAIM_LEVELS = ("observed", "directional", "causal")
 BUSINESS_SOURCES = (
     "production_telemetry",
@@ -170,6 +174,14 @@ RUN_ROW_KEYS = frozenset(
     {
         "task_id",
         "trial",
+        "receipt_sha256",
+        "pack_sha256",
+        "tool_surface_sha256",
+        "candidate_config_sha256",
+        "prompt_policy_sha256",
+        "verifier_policy_version",
+        "verifier_policy_sha256",
+        "verifier_evidence_sha256",
         "status",
         "latency_seconds",
         "first_model_response_seconds",
@@ -180,6 +192,9 @@ RUN_ROW_KEYS = frozenset(
         "reasoning_tokens",
         "output_tokens",
         "inference_calls",
+        "llm_inference_cost_usd",
+        "paid_media_credits",
+        "cost_cap_respected",
         "tool_metrics",
         "human_interventions",
         "false_completion",
@@ -198,7 +213,7 @@ TOOL_METRIC_KEYS = frozenset(
         "errors",
         "invalid_arguments",
         "redundant_calls",
-        "recovered_errors",
+        "same_tool_successes_after_error",
         "latency_seconds",
     }
 )
@@ -211,7 +226,109 @@ BUSINESS_OBSERVATION_KEYS = frozenset(
         "window",
         "claim_level",
         "source",
+        "evidence",
     }
+)
+RUN_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "variant_id",
+        "comparison_kind",
+        "ablation_group_id",
+        "standard_version",
+        "standard_sha256",
+        "task_pack_identity_sha256",
+        "pack_sha256",
+        "tool_surface_sha256",
+        "candidate_config",
+        "candidate_config_sha256",
+        "prompt_policy_sha256",
+        "verifier_policy_version",
+        "verifier_policy_sha256",
+        "calibration_gate",
+        "result_matrix_sha256",
+        "runtime_matrix_sha256",
+        "result_binding_sha256",
+        "business_observations_sha256",
+        "attestation",
+    }
+)
+CANDIDATE_KEYS = frozenset(
+    {
+        "schema_version",
+        "manifest",
+        "result_rows",
+        "run_rows",
+        "result_receipt_bindings",
+        "business_observations",
+    }
+)
+RESULT_BINDING_KEYS = frozenset({"task_id", "trial", "receipt_sha256"})
+VERIFIER_ANNOTATION_KEYS = frozenset(
+    {
+        "verifier_policy_version",
+        "verifier_policy_sha256",
+        "verifier_evidence_sha256",
+        "human_interventions",
+        "false_completion",
+        "destructive_side_effect",
+        "context_limit_hit",
+        "stuck_loop",
+        "external_dependency_failure",
+        "redundant_calls_by_tool",
+    }
+)
+OBSERVED_EVIDENCE_KEYS = frozenset(
+    {"cohort_id", "query_sha256", "exposure_identity_sha256"}
+)
+DIRECTIONAL_EVIDENCE_KEYS = frozenset(
+    {
+        "cohort_id",
+        "query_sha256",
+        "exposure_identity_sha256",
+        "comparator_numerator",
+        "comparator_denominator",
+        "comparator_window",
+        "comparator_query_sha256",
+        "comparator_exposure_identity_sha256",
+    }
+)
+CAUSAL_EVIDENCE_KEYS = frozenset(
+    {
+        "experiment_id",
+        "assignment_unit",
+        "control_numerator",
+        "control_denominator",
+        "analysis_policy_version",
+        "analysis_artifact_sha256",
+        "exposure_identity_sha256",
+        "control_exposure_identity_sha256",
+        "effect_ci_lower",
+        "effect_ci_upper",
+    }
+)
+CALIBRATION_GATE_KEYS = frozenset(
+    {"policy_version", "evidence_sha256", "passed"}
+)
+ATTESTATION_KEYS = frozenset({"key_id", "algorithm", "hmac_sha256"})
+RUNTIME_STATUSES = frozenset(
+    {
+        "completed",
+        "request_too_large",
+        "cost_preflight_blocked",
+        "cost_cap_exceeded",
+        "tool_limit_exceeded",
+        "tool_policy_violation",
+        "project_scope_violation",
+        "step_limit_exceeded",
+        "harness_error",
+    }
+)
+EXECUTION_INVALID_STATUSES = frozenset(
+    {"tool_policy_violation", "project_scope_violation", "harness_error"}
+)
+COST_GATE_FAILED_STATUSES = frozenset(
+    {"cost_preflight_blocked", "cost_cap_exceeded"}
 )
 
 
@@ -253,6 +370,121 @@ def _count(value: Any, label: str) -> int:
     return value
 
 
+def _nonempty(value: Any, label: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{label} must be non-empty")
+    return text
+
+
+def _sha256_value(value: Any, label: str) -> str:
+    digest = _nonempty(value, label)
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return digest
+
+
+def _matrix_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
+    ordered = sorted(rows, key=lambda row: (str(row.get("task_id")), row.get("trial")))
+    return sha256(ordered)
+
+
+def build_run_manifest(
+    *,
+    variant_id: str,
+    comparison_kind: str,
+    ablation_group_id: str | None,
+    task_pack_identity_sha256: str,
+    pack_sha256: str,
+    tool_surface_sha256: str,
+    candidate_config: Mapping[str, Any],
+    prompt_policy_sha256: str,
+    verifier_policy_version: str,
+    verifier_policy_sha256: str,
+    calibration_gate: Mapping[str, Any],
+    result_rows: Sequence[Mapping[str, Any]],
+    run_rows: Sequence[Mapping[str, Any]],
+    result_receipt_bindings: Sequence[Mapping[str, Any]],
+    business_observations: Sequence[Mapping[str, Any]],
+    key_id: str,
+    signing_key: bytes,
+    public_standard: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build and authenticate the identity binding quality and runtime matrices."""
+
+    public = dict(public_standard or standard())
+    if comparison_kind not in {"standard", "tool_ablation"}:
+        raise ValueError("comparison_kind must be standard or tool_ablation")
+    if comparison_kind == "tool_ablation" and not ablation_group_id:
+        raise ValueError("tool ablation requires ablation_group_id")
+    if not isinstance(candidate_config, Mapping):
+        raise ValueError("candidate_config must be an object")
+    config = dict(candidate_config)
+    _nonempty(config.get("exact_model_id"), "candidate_config.exact_model_id")
+    _nonempty(config.get("provider_slug"), "candidate_config.provider_slug")
+    if set(calibration_gate) != CALIBRATION_GATE_KEYS:
+        raise ValueError("calibration gate keys are not canonical")
+    if not isinstance(calibration_gate["passed"], bool):
+        raise ValueError("calibration gate passed must be boolean")
+    if not isinstance(signing_key, bytes) or len(signing_key) < 16:
+        raise ValueError("manifest signing key must contain at least 16 bytes")
+    body = {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "variant_id": _nonempty(variant_id, "variant_id"),
+        "comparison_kind": comparison_kind,
+        "ablation_group_id": (
+            None
+            if ablation_group_id is None
+            else _nonempty(ablation_group_id, "ablation_group_id")
+        ),
+        "standard_version": public["standard_version"],
+        "standard_sha256": public["standard_sha256"],
+        "task_pack_identity_sha256": _sha256_value(
+            task_pack_identity_sha256, "task_pack_identity_sha256"
+        ),
+        "pack_sha256": _sha256_value(pack_sha256, "pack_sha256"),
+        "tool_surface_sha256": _sha256_value(
+            tool_surface_sha256, "tool_surface_sha256"
+        ),
+        "candidate_config": config,
+        "candidate_config_sha256": sha256(config),
+        "prompt_policy_sha256": _sha256_value(
+            prompt_policy_sha256, "prompt_policy_sha256"
+        ),
+        "verifier_policy_version": _nonempty(
+            verifier_policy_version, "verifier_policy_version"
+        ),
+        "verifier_policy_sha256": _sha256_value(
+            verifier_policy_sha256, "verifier_policy_sha256"
+        ),
+        "calibration_gate": {
+            "policy_version": _nonempty(
+                calibration_gate["policy_version"], "calibration_gate.policy_version"
+            ),
+            "evidence_sha256": _sha256_value(
+                calibration_gate["evidence_sha256"],
+                "calibration_gate.evidence_sha256",
+            ),
+            "passed": calibration_gate["passed"],
+        },
+        "result_matrix_sha256": _matrix_sha256(result_rows),
+        "runtime_matrix_sha256": _matrix_sha256(run_rows),
+        "result_binding_sha256": _matrix_sha256(result_receipt_bindings),
+        "business_observations_sha256": sha256(
+            sorted(business_observations, key=lambda row: str(row.get("metric_id")))
+        ),
+    }
+    signature = hmac.new(signing_key, canonical_bytes(body), hashlib.sha256).hexdigest()
+    return {
+        **body,
+        "attestation": {
+            "key_id": _nonempty(key_id, "key_id"),
+            "algorithm": "hmac-sha256",
+            "hmac_sha256": signature,
+        },
+    }
+
+
 def _rate(numerator: float, denominator: float) -> float | None:
     return None if denominator == 0 else round(numerator / denominator, 6)
 
@@ -292,7 +524,7 @@ def _validate_tool_metric(raw: Mapping[str, Any], label: str) -> dict[str, Any]:
             "errors",
             "invalid_arguments",
             "redundant_calls",
-            "recovered_errors",
+            "same_tool_successes_after_error",
         )
     }
     if counts["successes"] + counts["errors"] != counts["dispatched"]:
@@ -303,9 +535,11 @@ def _validate_tool_metric(raw: Mapping[str, Any], label: str) -> dict[str, Any]:
         raise ValueError(f"{label}: invalid arguments must be undispatched attempts")
     if counts["redundant_calls"] > counts["dispatched"]:
         raise ValueError(f"{label}: redundant calls cannot exceed dispatched")
-    recoverable = counts["invalid_arguments"] + counts["errors"]
-    if counts["recovered_errors"] > recoverable:
-        raise ValueError(f"{label}: recovered errors exceed observed errors")
+    preceding_errors = counts["invalid_arguments"] + counts["errors"]
+    if counts["same_tool_successes_after_error"] > preceding_errors:
+        raise ValueError(
+            f"{label}: same-tool successes after error exceed observed errors"
+        )
     return {
         "name": name,
         **counts,
@@ -314,7 +548,9 @@ def _validate_tool_metric(raw: Mapping[str, Any], label: str) -> dict[str, Any]:
 
 
 def _validate_run_rows(
-    rows: Sequence[Mapping[str, Any]], public: Mapping[str, Any]
+    rows: Sequence[Mapping[str, Any]],
+    public: Mapping[str, Any],
+    manifest: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     expected = _expected_cells(public)
     seen: set[tuple[str, int]] = set()
@@ -325,8 +561,8 @@ def _validate_run_rows(
             raise ValueError(f"{label}: keys are not canonical")
         task_id = str(raw["task_id"])
         status = str(raw["status"]).strip()
-        if not status:
-            raise ValueError(f"{label}.status must be non-empty")
+        if status not in RUNTIME_STATUSES:
+            raise ValueError(f"{label}.status is not canonical")
         trial = raw["trial"]
         if isinstance(trial, bool) or not isinstance(trial, int):
             raise ValueError(f"{label}.trial must be an integer")
@@ -348,6 +584,8 @@ def _validate_run_rows(
         }
         if any(not isinstance(value, bool) for value in booleans.values()):
             raise ValueError(f"{label}: incident fields must be booleans")
+        if not isinstance(raw["cost_cap_respected"], bool):
+            raise ValueError(f"{label}.cost_cap_respected must be boolean")
         tool_metrics = raw["tool_metrics"]
         if not isinstance(tool_metrics, list):
             raise ValueError(f"{label}.tool_metrics must be a list")
@@ -364,11 +602,29 @@ def _validate_run_rows(
                 "trial": trial,
                 "status": status,
                 **{
+                    key: _sha256_value(raw[key], f"{label}.{key}")
+                    for key in (
+                        "receipt_sha256",
+                        "pack_sha256",
+                        "tool_surface_sha256",
+                        "candidate_config_sha256",
+                        "prompt_policy_sha256",
+                        "verifier_policy_sha256",
+                        "verifier_evidence_sha256",
+                    )
+                },
+                "verifier_policy_version": _nonempty(
+                    raw["verifier_policy_version"],
+                    f"{label}.verifier_policy_version",
+                ),
+                **{
                     key: _number(raw[key], f"{label}.{key}")
                     for key in (
                         "latency_seconds",
                         "inference_seconds",
                         "mcp_seconds",
+                        "llm_inference_cost_usd",
+                        "paid_media_credits",
                     )
                 },
                 "first_model_response_seconds": _optional_number(
@@ -387,15 +643,43 @@ def _validate_run_rows(
                     )
                 },
                 "tool_metrics": tools,
+                "cost_cap_respected": raw["cost_cap_respected"],
                 **booleans,
             }
         )
         row = validated[-1]
+        for key in (
+            "pack_sha256",
+            "tool_surface_sha256",
+            "candidate_config_sha256",
+            "prompt_policy_sha256",
+            "verifier_policy_version",
+            "verifier_policy_sha256",
+        ):
+            if row[key] != manifest[key]:
+                raise ValueError(f"{label}: {key} differs from run manifest")
         if (
             row["first_model_response_seconds"] is not None
-            and row["first_model_response_seconds"] > row["latency_seconds"]
+            and row["first_model_response_seconds"]
+            > row["latency_seconds"] + CLOCK_TOLERANCE_SECONDS
         ):
             raise ValueError(f"{label}: first model response exceeds total latency")
+        for key in ("inference_seconds", "mcp_seconds"):
+            if row[key] > row["latency_seconds"] + CLOCK_TOLERANCE_SECONDS:
+                raise ValueError(f"{label}: {key} exceeds total latency")
+        if (
+            row["inference_seconds"] + row["mcp_seconds"]
+            > row["latency_seconds"] + CLOCK_TOLERANCE_SECONDS
+        ):
+            raise ValueError(f"{label}: inference plus MCP time exceeds total latency")
+        tool_latency = sum(tool["latency_seconds"] for tool in row["tool_metrics"])
+        if not math.isclose(
+            tool_latency,
+            row["mcp_seconds"],
+            rel_tol=0.0,
+            abs_tol=CLOCK_TOLERANCE_SECONDS,
+        ):
+            raise ValueError(f"{label}: per-tool latency differs from MCP time")
         if row["cached_input_tokens"] > row["input_tokens"]:
             raise ValueError(f"{label}: cached input tokens exceed input tokens")
     if seen != expected:
@@ -406,35 +690,70 @@ def _validate_run_rows(
     return validated
 
 
+def _validate_result_bindings(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    public: Mapping[str, Any],
+    runs: Sequence[Mapping[str, Any]],
+) -> None:
+    expected = _expected_cells(public)
+    run_receipts = {
+        (row["task_id"], row["trial"]): row["receipt_sha256"] for row in runs
+    }
+    seen: set[tuple[str, int]] = set()
+    for index, raw in enumerate(rows, 1):
+        label = f"result-binding-{index}"
+        if set(raw) != RESULT_BINDING_KEYS:
+            raise ValueError(f"{label}: keys are not canonical")
+        trial = raw["trial"]
+        if isinstance(trial, bool) or not isinstance(trial, int):
+            raise ValueError(f"{label}.trial must be an integer")
+        cell = (str(raw["task_id"]), trial)
+        if cell not in expected:
+            raise ValueError(f"{label}: unknown result cell {cell}")
+        if cell in seen:
+            raise ValueError(f"{label}: duplicate result cell {cell}")
+        seen.add(cell)
+        receipt_sha = _sha256_value(raw["receipt_sha256"], f"{label}.receipt_sha256")
+        if receipt_sha != run_receipts[cell]:
+            raise ValueError(f"{label}: result and runtime receipt identities differ")
+    if seen != expected:
+        raise ValueError(
+            "result bindings must contain exactly 300 canonical cells "
+            f"(missing={len(expected - seen)}, extra={len(seen - expected)})"
+        )
+
+
 def run_row_from_receipt(
     receipt: Mapping[str, Any],
     *,
     trial: int,
-    annotations: Mapping[str, Any] | None = None,
+    annotations: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Convert a v2 execution receipt plus verifier annotations to telemetry."""
 
     if receipt.get("schema_version") != "aivideo-bench-candidate-execution-v2":
         raise ValueError("company telemetry requires a v2 candidate execution receipt")
-    notes = dict(annotations or {})
-    allowed_notes = {
-        "human_interventions",
-        "false_completion",
-        "destructive_side_effect",
-        "context_limit_hit",
-        "stuck_loop",
-        "external_dependency_failure",
-        "redundant_calls_by_tool",
-    }
-    if set(notes) - allowed_notes:
-        raise ValueError("unknown verifier annotation keys")
-    redundant = notes.get("redundant_calls_by_tool", {})
+    notes = dict(annotations)
+    if set(notes) != VERIFIER_ANNOTATION_KEYS:
+        raise ValueError("verifier annotation keys are not complete and canonical")
+    redundant = notes["redundant_calls_by_tool"]
     if not isinstance(redundant, Mapping):
         raise ValueError("redundant_calls_by_tool must be an object")
     token_usage = receipt.get("token_usage")
     receipt_tools = receipt.get("tool_metrics")
-    if not isinstance(token_usage, Mapping) or not isinstance(receipt_tools, list):
-        raise ValueError("v2 receipt is missing token or tool telemetry")
+    candidate_config = receipt.get("candidate")
+    if (
+        not isinstance(token_usage, Mapping)
+        or not isinstance(receipt_tools, list)
+        or not isinstance(candidate_config, Mapping)
+    ):
+        raise ValueError("v2 receipt is missing candidate, token, or tool telemetry")
+    if any(not isinstance(tool, Mapping) for tool in receipt_tools):
+        raise ValueError("receipt tool metrics must be objects")
+    receipt_tool_names = {str(tool.get("name") or "") for tool in receipt_tools}
+    if set(redundant) != receipt_tool_names:
+        raise ValueError("redundant tool annotations must exactly match receipt tools")
     tools = []
     for index, tool in enumerate(receipt_tools):
         if not isinstance(tool, Mapping):
@@ -449,13 +768,23 @@ def run_row_from_receipt(
                 "errors": tool.get("errors"),
                 "invalid_arguments": tool.get("invalid_arguments"),
                 "redundant_calls": redundant.get(name, 0),
-                "recovered_errors": tool.get("recovered_errors"),
+                "same_tool_successes_after_error": tool.get(
+                    "same_tool_successes_after_error"
+                ),
                 "latency_seconds": tool.get("latency_seconds"),
             }
         )
     row = {
         "task_id": receipt.get("task_id"),
         "trial": trial,
+        "receipt_sha256": sha256(receipt),
+        "pack_sha256": receipt.get("pack_sha256"),
+        "tool_surface_sha256": receipt.get("tool_surface_sha256"),
+        "candidate_config_sha256": sha256(dict(candidate_config)),
+        "prompt_policy_sha256": receipt.get("prompt_policy_sha256"),
+        "verifier_policy_version": notes["verifier_policy_version"],
+        "verifier_policy_sha256": notes["verifier_policy_sha256"],
+        "verifier_evidence_sha256": notes["verifier_evidence_sha256"],
         "status": receipt.get("status"),
         "latency_seconds": receipt.get("latency_seconds"),
         "first_model_response_seconds": receipt.get("first_model_response_seconds"),
@@ -466,15 +795,16 @@ def run_row_from_receipt(
         "reasoning_tokens": token_usage.get("reasoning_tokens"),
         "output_tokens": token_usage.get("output_tokens"),
         "inference_calls": receipt.get("inference_calls"),
+        "llm_inference_cost_usd": receipt.get("llm_inference_cost_usd"),
+        "paid_media_credits": receipt.get("paid_media_credits"),
+        "cost_cap_respected": receipt.get("cost_cap_respected"),
         "tool_metrics": tools,
-        "human_interventions": notes.get("human_interventions", 0),
-        "false_completion": notes.get("false_completion", False),
-        "destructive_side_effect": notes.get("destructive_side_effect", False),
-        "context_limit_hit": notes.get("context_limit_hit", False),
-        "stuck_loop": notes.get("stuck_loop", False),
-        "external_dependency_failure": notes.get(
-            "external_dependency_failure", False
-        ),
+        "human_interventions": notes["human_interventions"],
+        "false_completion": notes["false_completion"],
+        "destructive_side_effect": notes["destructive_side_effect"],
+        "context_limit_hit": notes["context_limit_hit"],
+        "stuck_loop": notes["stuck_loop"],
+        "external_dependency_failure": notes["external_dependency_failure"],
     }
     # Validate one row through the same primitives; matrix completeness is
     # intentionally enforced only after all 300 rows are assembled.
@@ -487,6 +817,7 @@ def run_row_from_receipt(
 
 def _business_observations(
     rows: Sequence[Mapping[str, Any]],
+    manifest: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
     observations: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(rows, 1):
@@ -515,8 +846,6 @@ def _business_observations(
             raise ValueError(f"{label}: unsupported claim level {claim_level}")
         if source not in BUSINESS_SOURCES:
             raise ValueError(f"{label}: unsupported source {source}")
-        if claim_level == "causal" and source != "experiment":
-            raise ValueError(f"{label}: causal claims require experiment source")
         if not window:
             raise ValueError(f"{label}.window must be non-empty")
         expected_value = numerator / denominator
@@ -524,6 +853,135 @@ def _business_observations(
             expected_value *= 100
         if not math.isclose(value, expected_value, rel_tol=1e-6, abs_tol=1e-9):
             raise ValueError(f"{label}: value does not match numerator and denominator")
+        evidence = raw["evidence"]
+        if not isinstance(evidence, Mapping):
+            raise ValueError(f"{label}.evidence must be an object")
+        expected_keys = {
+            "observed": OBSERVED_EVIDENCE_KEYS,
+            "directional": DIRECTIONAL_EVIDENCE_KEYS,
+            "causal": CAUSAL_EVIDENCE_KEYS,
+        }[claim_level]
+        if set(evidence) != expected_keys:
+            raise ValueError(f"{label}: {claim_level} evidence keys are not canonical")
+        if evidence.get("exposure_identity_sha256") != manifest["candidate_config_sha256"]:
+            raise ValueError(f"{label}: business exposure differs from candidate identity")
+        validated_evidence: dict[str, Any]
+        if claim_level == "observed":
+            if source != metric["source"]:
+                raise ValueError(f"{label}: observed source differs from metric registry")
+            validated_evidence = {
+                "cohort_id": _nonempty(evidence["cohort_id"], f"{label}.cohort_id"),
+                "query_sha256": _sha256_value(
+                    evidence["query_sha256"], f"{label}.query_sha256"
+                ),
+                "exposure_identity_sha256": manifest["candidate_config_sha256"],
+            }
+        elif claim_level == "directional":
+            if source != metric["source"]:
+                raise ValueError(f"{label}: directional source differs from metric registry")
+            comparator_numerator = _number(
+                evidence["comparator_numerator"],
+                f"{label}.comparator_numerator",
+                minimum=minimum,
+            )
+            comparator_denominator = _count(
+                evidence["comparator_denominator"],
+                f"{label}.comparator_denominator",
+            )
+            if comparator_denominator == 0:
+                raise ValueError(f"{label}.comparator_denominator must be positive")
+            comparator_value = comparator_numerator / comparator_denominator
+            if metric["unit"] == "per_100":
+                comparator_value *= 100
+            if metric["unit"] == "rate" and comparator_value > 1:
+                raise ValueError(f"{label}: comparator rate exceeds 1")
+            validated_evidence = {
+                "cohort_id": _nonempty(evidence["cohort_id"], f"{label}.cohort_id"),
+                "query_sha256": _sha256_value(
+                    evidence["query_sha256"], f"{label}.query_sha256"
+                ),
+                "exposure_identity_sha256": manifest["candidate_config_sha256"],
+                "comparator_numerator": comparator_numerator,
+                "comparator_denominator": comparator_denominator,
+                "comparator_window": _nonempty(
+                    evidence["comparator_window"], f"{label}.comparator_window"
+                ),
+                "comparator_query_sha256": _sha256_value(
+                    evidence["comparator_query_sha256"],
+                    f"{label}.comparator_query_sha256",
+                ),
+                "comparator_exposure_identity_sha256": _sha256_value(
+                    evidence["comparator_exposure_identity_sha256"],
+                    f"{label}.comparator_exposure_identity_sha256",
+                ),
+                "comparator_value": round(comparator_value, 9),
+                "absolute_delta": round(value - comparator_value, 9),
+            }
+        else:
+            if source != "experiment":
+                raise ValueError(f"{label}: causal claims require experiment source")
+            control_numerator = _number(
+                evidence["control_numerator"],
+                f"{label}.control_numerator",
+                minimum=minimum,
+            )
+            control_denominator = _count(
+                evidence["control_denominator"], f"{label}.control_denominator"
+            )
+            if control_denominator == 0:
+                raise ValueError(f"{label}.control_denominator must be positive")
+            assignment_unit = _nonempty(
+                evidence["assignment_unit"], f"{label}.assignment_unit"
+            )
+            if assignment_unit not in {"user", "project", "session", "task"}:
+                raise ValueError(f"{label}: unsupported experiment assignment unit")
+            control_value = control_numerator / control_denominator
+            if metric["unit"] == "per_100":
+                control_value *= 100
+            if metric["unit"] == "rate" and control_value > 1:
+                raise ValueError(f"{label}: control rate exceeds 1")
+            effect = value - control_value
+            effect_minimum = -1.0 if metric["unit"] == "rate" else -math.inf
+            effect_maximum = 1.0 if metric["unit"] == "rate" else None
+            ci_lower = _number(
+                evidence["effect_ci_lower"],
+                f"{label}.effect_ci_lower",
+                minimum=effect_minimum,
+                maximum=effect_maximum,
+            )
+            ci_upper = _number(
+                evidence["effect_ci_upper"],
+                f"{label}.effect_ci_upper",
+                minimum=effect_minimum,
+                maximum=effect_maximum,
+            )
+            if ci_lower > effect or effect > ci_upper:
+                raise ValueError(f"{label}: effect is outside confidence interval")
+            validated_evidence = {
+                "experiment_id": _nonempty(
+                    evidence["experiment_id"], f"{label}.experiment_id"
+                ),
+                "assignment_unit": assignment_unit,
+                "control_numerator": control_numerator,
+                "control_denominator": control_denominator,
+                "analysis_policy_version": _nonempty(
+                    evidence["analysis_policy_version"],
+                    f"{label}.analysis_policy_version",
+                ),
+                "analysis_artifact_sha256": _sha256_value(
+                    evidence["analysis_artifact_sha256"],
+                    f"{label}.analysis_artifact_sha256",
+                ),
+                "exposure_identity_sha256": manifest["candidate_config_sha256"],
+                "control_exposure_identity_sha256": _sha256_value(
+                    evidence["control_exposure_identity_sha256"],
+                    f"{label}.control_exposure_identity_sha256",
+                ),
+                "control_value": round(control_value, 9),
+                "absolute_effect": round(effect, 9),
+                "effect_ci_lower": ci_lower,
+                "effect_ci_upper": ci_upper,
+            }
         observations[metric_id] = {
             "value": value,
             "numerator": numerator,
@@ -531,34 +989,234 @@ def _business_observations(
             "window": window,
             "claim_level": claim_level,
             "source": source,
+            "evidence": validated_evidence,
         }
     return observations
 
 
+def _validate_run_manifest(
+    raw: Mapping[str, Any],
+    *,
+    signing_key: bytes,
+    public: Mapping[str, Any],
+    result_rows: Sequence[Mapping[str, Any]],
+    run_rows: Sequence[Mapping[str, Any]],
+    result_receipt_bindings: Sequence[Mapping[str, Any]],
+    business_observations: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    if set(raw) != RUN_MANIFEST_KEYS:
+        raise ValueError("run manifest keys are not canonical")
+    if raw.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("unsupported run manifest schema_version")
+    if not isinstance(signing_key, bytes) or len(signing_key) < 16:
+        raise ValueError("manifest signing key must contain at least 16 bytes")
+    attestation = raw["attestation"]
+    if not isinstance(attestation, Mapping) or set(attestation) != ATTESTATION_KEYS:
+        raise ValueError("manifest attestation keys are not canonical")
+    if attestation.get("algorithm") != "hmac-sha256":
+        raise ValueError("unsupported manifest attestation algorithm")
+    _nonempty(attestation.get("key_id"), "manifest.attestation.key_id")
+    supplied_hmac = _sha256_value(
+        attestation.get("hmac_sha256"), "manifest.attestation.hmac_sha256"
+    )
+    body = {key: value for key, value in raw.items() if key != "attestation"}
+    expected_hmac = hmac.new(
+        signing_key, canonical_bytes(body), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_hmac, expected_hmac):
+        raise ValueError("run manifest HMAC mismatch")
+    comparison_kind = str(raw["comparison_kind"])
+    if comparison_kind not in {"standard", "tool_ablation"}:
+        raise ValueError("comparison_kind must be standard or tool_ablation")
+    ablation_group_id = raw["ablation_group_id"]
+    if ablation_group_id is not None:
+        ablation_group_id = _nonempty(
+            ablation_group_id, "manifest.ablation_group_id"
+        )
+    if comparison_kind == "tool_ablation" and ablation_group_id is None:
+        raise ValueError("tool ablation requires ablation_group_id")
+    candidate_config = raw["candidate_config"]
+    if not isinstance(candidate_config, Mapping):
+        raise ValueError("manifest.candidate_config must be an object")
+    config = dict(candidate_config)
+    model = _nonempty(
+        config.get("exact_model_id"), "manifest.candidate_config.exact_model_id"
+    )
+    provider = _nonempty(
+        config.get("provider_slug"), "manifest.candidate_config.provider_slug"
+    )
+    calibration = raw["calibration_gate"]
+    if not isinstance(calibration, Mapping) or set(calibration) != CALIBRATION_GATE_KEYS:
+        raise ValueError("manifest calibration gate keys are not canonical")
+    if not isinstance(calibration["passed"], bool):
+        raise ValueError("manifest calibration passed must be boolean")
+    manifest = {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "variant_id": _nonempty(raw["variant_id"], "manifest.variant_id"),
+        "model": model,
+        "provider": provider,
+        "comparison_kind": comparison_kind,
+        "ablation_group_id": ablation_group_id,
+        "standard_version": _nonempty(
+            raw["standard_version"], "manifest.standard_version"
+        ),
+        **{
+            key: _sha256_value(raw[key], f"manifest.{key}")
+            for key in (
+                "standard_sha256",
+                "task_pack_identity_sha256",
+                "pack_sha256",
+                "tool_surface_sha256",
+                "candidate_config_sha256",
+                "prompt_policy_sha256",
+                "verifier_policy_sha256",
+                "result_matrix_sha256",
+                "runtime_matrix_sha256",
+                "result_binding_sha256",
+                "business_observations_sha256",
+            )
+        },
+        "verifier_policy_version": _nonempty(
+            raw["verifier_policy_version"], "manifest.verifier_policy_version"
+        ),
+        "candidate_config": config,
+        "calibration_gate": {
+            "policy_version": _nonempty(
+                calibration["policy_version"],
+                "manifest.calibration_gate.policy_version",
+            ),
+            "evidence_sha256": _sha256_value(
+                calibration["evidence_sha256"],
+                "manifest.calibration_gate.evidence_sha256",
+            ),
+            "passed": calibration["passed"],
+        },
+        "attestation": dict(attestation),
+    }
+    if manifest["candidate_config_sha256"] != sha256(config):
+        raise ValueError("candidate configuration hash differs from manifest object")
+    if manifest["standard_version"] != public["standard_version"] or manifest[
+        "standard_sha256"
+    ] != public["standard_sha256"]:
+        raise ValueError("run manifest differs from the public standard")
+    if manifest["result_matrix_sha256"] != _matrix_sha256(result_rows):
+        raise ValueError("result matrix hash differs from run manifest")
+    if manifest["runtime_matrix_sha256"] != _matrix_sha256(run_rows):
+        raise ValueError("runtime matrix hash differs from run manifest")
+    if manifest["result_binding_sha256"] != _matrix_sha256(
+        result_receipt_bindings
+    ):
+        raise ValueError("result binding hash differs from run manifest")
+    if manifest["business_observations_sha256"] != sha256(
+        sorted(business_observations, key=lambda row: str(row.get("metric_id")))
+    ):
+        raise ValueError("business observations hash differs from run manifest")
+    return manifest
+
+
 def summarize_company_candidate(
-    candidate: Mapping[str, Any], *, public_standard: Mapping[str, Any] | None = None
+    candidate: Mapping[str, Any],
+    *,
+    manifest_signing_key: bytes,
+    public_standard: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate one complete candidate and summarize all three evidence planes."""
 
     if candidate.get("schema_version") != COMPANY_INPUT_SCHEMA_VERSION:
         raise ValueError("unsupported company candidate schema_version")
+    if set(candidate) != CANDIDATE_KEYS:
+        raise ValueError("company candidate keys are not canonical")
     public = dict(public_standard or standard())
-    model = str(candidate.get("model") or "").strip()
-    provider = str(candidate.get("provider") or "").strip()
-    if not model or not provider:
-        raise ValueError("model and provider must be non-empty")
     result_rows = candidate.get("result_rows")
     run_rows = candidate.get("run_rows")
+    result_receipt_bindings = candidate.get("result_receipt_bindings")
     business_rows = candidate.get("business_observations", [])
-    if not isinstance(result_rows, list) or not isinstance(run_rows, list):
-        raise ValueError("result_rows and run_rows must be lists")
+    if (
+        not isinstance(result_rows, list)
+        or not isinstance(run_rows, list)
+        or not isinstance(result_receipt_bindings, list)
+    ):
+        raise ValueError("result rows, run rows, and result bindings must be lists")
     if not isinstance(business_rows, list):
         raise ValueError("business_observations must be a list")
+    raw_manifest = candidate.get("manifest")
+    if not isinstance(raw_manifest, Mapping):
+        raise ValueError("manifest must be an object")
+    manifest = _validate_run_manifest(
+        raw_manifest,
+        signing_key=manifest_signing_key,
+        public=public,
+        result_rows=result_rows,
+        run_rows=run_rows,
+        result_receipt_bindings=result_receipt_bindings,
+        business_observations=business_rows,
+    )
+    model = manifest["model"]
+    provider = manifest["provider"]
     quality = summarize_results(
         result_rows, model=model, provider=provider, public_standard=public
     )
-    runs = _validate_run_rows(run_rows, public)
-    business = _business_observations(business_rows)
+    runs = _validate_run_rows(run_rows, public, manifest)
+    _validate_result_bindings(
+        result_receipt_bindings, public=public, runs=runs
+    )
+    result_by_cell = {
+        (row["task_id"], row["trial"]): row for row in result_rows
+    }
+    for row in runs:
+        result = result_by_cell[(row["task_id"], row["trial"])]
+        if row["status"] != "completed" and (
+            result["operational_success"] or result["exact_success"]
+        ):
+            raise ValueError(
+                "non-completed runtime cannot be operational or exact success"
+            )
+        if (
+            row["destructive_side_effect"]
+            or row["false_completion"]
+            or row["stuck_loop"]
+        ) and (result["operational_success"] or result["exact_success"]):
+            raise ValueError(
+                "catastrophic runtime annotation contradicts scored success"
+            )
+        if (
+            row["status"] in EXECUTION_INVALID_STATUSES
+            and result["execution_valid"]
+        ):
+            raise ValueError(
+                "policy or harness runtime status contradicts execution validity"
+            )
+        if row["status"] in COST_GATE_FAILED_STATUSES and row[
+            "cost_cap_respected"
+        ]:
+            raise ValueError(
+                "cost-gate-failed runtime cannot report a respected cost cap"
+            )
+        if not math.isclose(
+            row["llm_inference_cost_usd"],
+            float(result["llm_inference_cost_usd"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("runtime and result inference cost differ")
+        if not math.isclose(
+            row["paid_media_credits"],
+            float(result["paid_media_credits"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("runtime and result paid-media credits differ")
+        if row["cost_cap_respected"] is not result["cost_cap_respected"]:
+            raise ValueError("runtime and result cost-cap status differ")
+    if quality["score_status"] == "valid" and not manifest["calibration_gate"][
+        "passed"
+    ]:
+        quality = {
+            **quality,
+            "score_status": "calibration_gate_failed",
+            "official_score": None,
+        }
+    business = _business_observations(business_rows, manifest)
 
     operational_successes = quality["operational_success"]["trials"]
     totals = defaultdict(float)
@@ -609,8 +1267,8 @@ def summarize_company_candidate(
                 "redundant_call_rate": _rate(
                     aggregate["redundant_calls"], aggregate["dispatched"]
                 ),
-                "error_recovery_rate": _rate(
-                    aggregate["recovered_errors"],
+                "same_tool_success_after_error_rate": _rate(
+                    aggregate["same_tool_successes_after_error"],
                     aggregate["invalid_arguments"] + aggregate["errors"],
                 ),
                 "latency_seconds": round(aggregate["latency_seconds"], 6),
@@ -623,6 +1281,9 @@ def summarize_company_candidate(
     return {
         "model": model,
         "provider": provider,
+        "variant_id": manifest["variant_id"],
+        "display_name": f"{model} [{manifest['variant_id']}]",
+        "manifest": manifest,
         "quality": quality,
         "speed": {
             "end_to_end_seconds": {
@@ -677,8 +1338,8 @@ def summarize_company_candidate(
             "redundant_call_rate": _rate(
                 tool_totals["redundant_calls"], tool_totals["dispatched"]
             ),
-            "error_recovery_rate": _rate(
-                tool_totals["recovered_errors"],
+            "same_tool_success_after_error_rate": _rate(
+                tool_totals["same_tool_successes_after_error"],
                 tool_totals["invalid_arguments"] + tool_totals["errors"],
             ),
             "by_tool": tools,
@@ -713,15 +1374,71 @@ def summarize_company_candidate(
     }
 
 
-def build_company_report(candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def build_company_report(
+    candidates: Sequence[Mapping[str, Any]], *, manifest_signing_key: bytes
+) -> dict[str, Any]:
     """Build a comparison report; deliberately do not choose one overall winner."""
 
     if not candidates:
         raise ValueError("at least one company candidate is required")
-    summaries = [summarize_company_candidate(candidate) for candidate in candidates]
-    identities = [(row["model"], row["provider"]) for row in summaries]
-    if len(identities) != len(set(identities)):
-        raise ValueError("candidate model/provider identities must be unique")
+    summaries = [
+        summarize_company_candidate(
+            candidate, manifest_signing_key=manifest_signing_key
+        )
+        for candidate in candidates
+    ]
+    variant_ids = [row["manifest"]["variant_id"] for row in summaries]
+    if len(variant_ids) != len(set(variant_ids)):
+        raise ValueError("candidate variant IDs must be unique")
+    shared_keys = (
+        "standard_version",
+        "standard_sha256",
+        "prompt_policy_sha256",
+        "verifier_policy_version",
+        "verifier_policy_sha256",
+        "task_pack_identity_sha256",
+    )
+    reference = summaries[0]["manifest"]
+    for summary in summaries[1:]:
+        manifest = summary["manifest"]
+        if any(manifest[key] != reference[key] for key in shared_keys):
+            raise ValueError("comparison candidates do not share evaluation policy")
+        if manifest["calibration_gate"] != reference["calibration_gate"]:
+            raise ValueError("comparison candidates do not share calibration evidence")
+    standard_manifests = [
+        summary["manifest"]
+        for summary in summaries
+        if summary["manifest"]["comparison_kind"] == "standard"
+    ]
+    if standard_manifests:
+        standard_reference = standard_manifests[0]
+        if any(
+            manifest["pack_sha256"] != standard_reference["pack_sha256"]
+            or manifest["tool_surface_sha256"]
+            != standard_reference["tool_surface_sha256"]
+            for manifest in standard_manifests[1:]
+        ):
+            raise ValueError("standard candidates do not share pack and tool surface")
+    by_ablation_group: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for summary in summaries:
+        group_id = summary["manifest"]["ablation_group_id"]
+        if group_id is not None:
+            by_ablation_group[group_id].append(summary["manifest"])
+    for group_id, manifests in by_ablation_group.items():
+        bases = [row for row in manifests if row["comparison_kind"] == "standard"]
+        ablations = [
+            row for row in manifests if row["comparison_kind"] == "tool_ablation"
+        ]
+        if len(bases) != 1 or not ablations:
+            raise ValueError(
+                f"ablation group {group_id} requires one standard base and an ablation"
+            )
+        base = bases[0]
+        for ablation in ablations:
+            if ablation["candidate_config_sha256"] != base["candidate_config_sha256"]:
+                raise ValueError("tool ablation candidate configuration differs from base")
+            if ablation["tool_surface_sha256"] == base["tool_surface_sha256"]:
+                raise ValueError("tool ablation must change the tool surface")
     return {
         "schema_version": COMPANY_REPORT_SCHEMA_VERSION,
         "standard_version": summaries[0]["quality"]["standard_version"],
@@ -772,7 +1489,7 @@ def render_company_markdown(report: Mapping[str, Any]) -> str:
             "| "
             + " | ".join(
                 (
-                    f"{row['model']} ({row['provider']})",
+                    f"{row['display_name']} ({row['provider']})",
                     score,
                     _format_rate(quality["operational_success"]["rate"]),
                     _format_rate(quality["exact_success"]["rate"]),
@@ -807,7 +1524,7 @@ def render_company_markdown(report: Mapping[str, Any]) -> str:
         tokens = economics["tokens"]
         first_response = speed["first_model_response_p50_seconds"]
         lines.append(
-            f"| {row['model']} | "
+            f"| {row['display_name']} | "
             f"{'n/a' if first_response is None else f'{first_response:.2f}s'} | "
             f"{speed['inference_seconds']:.2f}s | {speed['mcp_seconds']:.2f}s | "
             f"{economics['inference_calls']} | "
@@ -830,7 +1547,7 @@ def render_company_markdown(report: Mapping[str, Any]) -> str:
             "| "
             + " | ".join(
                 [
-                    row["model"],
+                    row["display_name"],
                     *(
                         _format_rate(reliability[key])
                         for key in (
@@ -849,9 +1566,9 @@ def render_company_markdown(report: Mapping[str, Any]) -> str:
     for row in candidates:
         lines.extend(
             [
-                f"### {row['model']}",
+                f"### {row['display_name']}",
                 "",
-                "| Tool | Attempts | Dispatched | Success | Invalid arguments | Redundant | Recovery | Tool time |",
+                "| Tool | Attempts | Dispatched | Success | Invalid arguments | Redundant | Same-tool success after error | Tool time |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
@@ -863,7 +1580,7 @@ def render_company_markdown(report: Mapping[str, Any]) -> str:
                 f"{_format_rate(tool['dispatch_success_rate'])} | "
                 f"{_format_rate(tool['invalid_argument_rate'])} | "
                 f"{_format_rate(tool['redundant_call_rate'])} | "
-                f"{_format_rate(tool['error_recovery_rate'])} | "
+                f"{_format_rate(tool['same_tool_success_after_error_rate'])} | "
                 f"{tool['latency_seconds']:.2f}s |"
             )
         lines.append("")
@@ -874,7 +1591,7 @@ def render_company_markdown(report: Mapping[str, Any]) -> str:
             "Claim levels: **observed** describes a cohort, **directional** adds a comparison, and **causal** requires a valid experiment or equivalent design.",
             "",
             "| Business question | Direction | "
-            + " | ".join(row["model"] for row in candidates)
+            + " | ".join(row["display_name"] for row in candidates)
             + " |",
             "|---|---:|" + "---:|" * len(candidates),
         ]
@@ -886,9 +1603,23 @@ def render_company_markdown(report: Mapping[str, Any]) -> str:
             if observation is None:
                 cells.append("not measured")
             else:
+                evidence = observation["evidence"]
+                comparison = ""
+                if observation["claim_level"] == "directional":
+                    comparison = (
+                        f", comparator={_format_business_value(evidence['comparator_value'], metric['unit'])}, "
+                        f"delta={_format_business_value(evidence['absolute_delta'], metric['unit'])}"
+                    )
+                elif observation["claim_level"] == "causal":
+                    comparison = (
+                        f", control={_format_business_value(evidence['control_value'], metric['unit'])}, "
+                        f"effect={_format_business_value(evidence['absolute_effect'], metric['unit'])}, "
+                        f"CI=[{_format_business_value(evidence['effect_ci_lower'], metric['unit'])}, "
+                        f"{_format_business_value(evidence['effect_ci_upper'], metric['unit'])}]"
+                    )
                 cells.append(
                     f"{_format_business_value(observation['value'], metric['unit'])} "
-                    f"(n={observation['denominator']}, {observation['claim_level']})"
+                    f"(n={observation['denominator']}, {observation['claim_level']}{comparison})"
                 )
         lines.append(
             f"| {metric['label']} | {metric['direction']} | " + " | ".join(cells) + " |"

@@ -306,7 +306,7 @@ def test_schema_error_is_model_visible_and_can_be_repaired():
             "successes": 1,
             "errors": 0,
             "invalid_arguments": 1,
-            "recovered_errors": 1,
+            "same_tool_successes_after_error": 1,
             "latency_seconds": receipt["tool_metrics"][0]["latency_seconds"],
         }
     ]
@@ -329,6 +329,8 @@ def test_conservative_cost_preflight_blocks_before_inference():
 
     assert receipt["status"] == "cost_preflight_blocked"
     assert receipt["inference_calls"] == 0
+    assert receipt["llm_inference_cost_usd"] == 0.0
+    assert receipt["cost_cap_respected"] is False
     assert completion.payloads == []
 
 

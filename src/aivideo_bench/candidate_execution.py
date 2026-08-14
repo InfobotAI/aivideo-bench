@@ -25,7 +25,7 @@ from .mcp_client import (
     tool_result_text,
     validate_tool_surface,
 )
-from .standard import canonical_bytes
+from .standard import canonical_bytes, sha256
 
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -36,6 +36,9 @@ Treat IDs and state as mutable; inspect context instead of guessing. Respect the
 tool allowlist, verify every tool result, preserve unrelated work, and finish
 with one short status sentence. Never claim an action that a tool did not
 confirm."""
+PROMPT_POLICY_SHA256 = sha256(
+    {"version": "aivideo-bench-candidate-prompt-v1", "system_prompt": SYSTEM_PROMPT}
+)
 
 
 class CompletionTransport(Protocol):
@@ -561,7 +564,7 @@ def run_candidate_task(
                 else:
                     aggregate["successes"] += 1
                     if outstanding_tool_errors[name]:
-                        aggregate["recovered_errors"] += 1
+                        aggregate["same_tool_successes_after_error"] += 1
                         outstanding_tool_errors[name] -= 1
                 pending_media.extend(
                     _tool_media_blocks(
@@ -605,6 +608,7 @@ def run_candidate_task(
         "pack_sha256": pack["pack_sha256"],
         "tool_surface_sha256": surface_policy["sha256"],
         "candidate": asdict(config),
+        "prompt_policy_sha256": PROMPT_POLICY_SHA256,
         "transport_identity": copy.deepcopy(dict(completion.identity)),
         "mcp_factory_identity": copy.deepcopy(dict(mcp_factory.identity)),
         "status": status,
@@ -615,7 +619,12 @@ def run_candidate_task(
         "mcp_tool_calls": sum(row.get("method") == "tools/call" for row in transcript),
         "llm_inference_cost_usd": round(spent, 9),
         "paid_media_credits": 0.0,
-        "cost_cap_respected": spent <= config.max_cost_per_task_usd + 1e-12,
+        # The official cost gate covers both feasibility before a call and the
+        # measured spend afterward. A preflight-blocked task is economically
+        # invalid even though it correctly spends zero dollars.
+        "cost_cap_respected": status
+        not in {"cost_preflight_blocked", "cost_cap_exceeded"}
+        and spent <= config.max_cost_per_task_usd + 1e-12,
         "request_sha256": request_hashes,
         "api_calls": api_calls,
         "mcp_transcript": transcript,
@@ -631,7 +640,7 @@ def run_candidate_task(
                         "successes",
                         "errors",
                         "invalid_arguments",
-                        "recovered_errors",
+                        "same_tool_successes_after_error",
                     )
                 },
                 "latency_seconds": round(aggregate["latency_seconds"], 6),
