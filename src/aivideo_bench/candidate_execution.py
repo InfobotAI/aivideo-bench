@@ -10,6 +10,7 @@ import math
 import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -24,7 +25,7 @@ from .mcp_client import (
     tool_result_text,
     validate_tool_surface,
 )
-from .standard import canonical_bytes
+from .standard import canonical_bytes, sha256
 
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -35,6 +36,9 @@ Treat IDs and state as mutable; inspect context instead of guessing. Respect the
 tool allowlist, verify every tool result, preserve unrelated work, and finish
 with one short status sentence. Never claim an action that a tool did not
 confirm."""
+PROMPT_POLICY_SHA256 = sha256(
+    {"version": "aivideo-bench-candidate-prompt-v1", "system_prompt": SYSTEM_PROMPT}
+)
 
 
 class CompletionTransport(Protocol):
@@ -314,6 +318,49 @@ def _error_tool_message(tool_call_id: str, name: str, error: str) -> dict[str, A
     }
 
 
+def _usage_totals(api_calls: list[Mapping[str, Any]]) -> dict[str, int]:
+    """Normalize common OpenRouter token fields without trusting one provider shape."""
+
+    totals = defaultdict(int)
+    for call in api_calls:
+        usage = call.get("usage")
+        if not isinstance(usage, Mapping):
+            continue
+        prompt_details = usage.get("prompt_tokens_details")
+        completion_details = usage.get("completion_tokens_details")
+        totals["input_tokens"] += int(
+            usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+        )
+        totals["output_tokens"] += int(
+            usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+        )
+        totals["cached_input_tokens"] += int(
+            (
+                prompt_details.get("cached_tokens", 0)
+                if isinstance(prompt_details, Mapping)
+                else usage.get("cache_read_input_tokens", 0)
+            )
+            or 0
+        )
+        totals["reasoning_tokens"] += int(
+            (
+                completion_details.get("reasoning_tokens", 0)
+                if isinstance(completion_details, Mapping)
+                else usage.get("reasoning_tokens", 0)
+            )
+            or 0
+        )
+    return {
+        key: totals[key]
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "reasoning_tokens",
+            "output_tokens",
+        )
+    }
+
+
 def run_candidate_task(
     private_task: Mapping[str, Any],
     *,
@@ -351,6 +398,11 @@ def run_candidate_task(
     spent = 0.0
     api_calls: list[dict[str, Any]] = []
     request_hashes: list[str] = []
+    inference_seconds = 0.0
+    mcp_seconds = 0.0
+    first_model_response_seconds: float | None = None
+    tool_metrics: dict[str, defaultdict[str, float]] = {}
+    outstanding_tool_errors: defaultdict[str, int] = defaultdict(int)
     started = time.monotonic()
     try:
         surface = client.initialize()
@@ -415,8 +467,12 @@ def run_candidate_task(
                 error = "conservative request bound exceeds the task cost ceiling"
                 break
             request_hashes.append(hashlib.sha256(request_bytes).hexdigest())
+            inference_started = time.monotonic()
             response = completion.complete(payload)
+            inference_seconds += time.monotonic() - inference_started
             inference_calls += 1
+            if first_model_response_seconds is None:
+                first_model_response_seconds = time.monotonic() - started
             message, call_cost, call_evidence = _response_message(response, config=config)
             spent += call_cost
             api_calls.append({"step": step, **call_evidence})
@@ -443,9 +499,11 @@ def run_candidate_task(
                 function = raw_call.get("function")
                 if not isinstance(function, Mapping):
                     raise ValueError("assistant tool call has no function object")
-                name = str(function.get("name") or "")
+                name = str(function.get("name") or "<missing>")
                 call_id = str(raw_call.get("id") or f"step-{step}-call-{tool_call_attempts + 1}")
                 tool_call_attempts += 1
+                aggregate = tool_metrics.setdefault(name, defaultdict(float))
+                aggregate["attempts"] += 1
                 if name not in allowed_names:
                     status = "tool_policy_violation"
                     error = f"candidate requested tool outside allowlist: {name}"
@@ -453,6 +511,8 @@ def run_candidate_task(
                 try:
                     arguments = json.loads(function.get("arguments") or "{}")
                 except json.JSONDecodeError as parse_error:
+                    aggregate["invalid_arguments"] += 1
+                    outstanding_tool_errors[name] += 1
                     messages.append(
                         _error_tool_message(
                             call_id, name, f"invalid_tool_arguments:{parse_error}"
@@ -460,6 +520,8 @@ def run_candidate_task(
                     )
                     continue
                 if not isinstance(arguments, dict):
+                    aggregate["invalid_arguments"] += 1
+                    outstanding_tool_errors[name] += 1
                     messages.append(
                         _error_tool_message(
                             call_id, name, "invalid_tool_arguments:expected object"
@@ -470,6 +532,8 @@ def run_candidate_task(
                     arguments, tools[name]["inputSchema"]
                 )
                 if schema_errors:
+                    aggregate["invalid_arguments"] += 1
+                    outstanding_tool_errors[name] += 1
                     messages.append(
                         _error_tool_message(
                             call_id,
@@ -488,7 +552,20 @@ def run_candidate_task(
                     status = "project_scope_violation"
                     error = "; ".join(scope_errors)
                     break
+                aggregate["dispatched"] += 1
+                tool_started = time.monotonic()
                 raw_result = client.call_tool(name, arguments)
+                tool_latency = time.monotonic() - tool_started
+                mcp_seconds += tool_latency
+                aggregate["latency_seconds"] += tool_latency
+                if raw_result.get("isError") is True:
+                    aggregate["errors"] += 1
+                    outstanding_tool_errors[name] += 1
+                else:
+                    aggregate["successes"] += 1
+                    if outstanding_tool_errors[name]:
+                        aggregate["same_tool_successes_after_error"] += 1
+                        outstanding_tool_errors[name] -= 1
                 pending_media.extend(
                     _tool_media_blocks(
                         raw_result, byte_limit=config.max_tool_media_bytes
@@ -525,12 +602,13 @@ def run_candidate_task(
         client.close()
     transcript = copy.deepcopy(client.transcript)
     return {
-        "schema_version": "aivideo-bench-candidate-execution-v1",
+        "schema_version": "aivideo-bench-candidate-execution-v2",
         "task_id": private_task["task_id"],
         "blueprint_sha256": private_task["blueprint_sha256"],
         "pack_sha256": pack["pack_sha256"],
         "tool_surface_sha256": surface_policy["sha256"],
         "candidate": asdict(config),
+        "prompt_policy_sha256": PROMPT_POLICY_SHA256,
         "transport_identity": copy.deepcopy(dict(completion.identity)),
         "mcp_factory_identity": copy.deepcopy(dict(mcp_factory.identity)),
         "status": status,
@@ -541,9 +619,40 @@ def run_candidate_task(
         "mcp_tool_calls": sum(row.get("method") == "tools/call" for row in transcript),
         "llm_inference_cost_usd": round(spent, 9),
         "paid_media_credits": 0.0,
-        "cost_cap_respected": spent <= config.max_cost_per_task_usd + 1e-12,
+        # The official cost gate covers both feasibility before a call and the
+        # measured spend afterward. A preflight-blocked task is economically
+        # invalid even though it correctly spends zero dollars.
+        "cost_cap_respected": status
+        not in {"cost_preflight_blocked", "cost_cap_exceeded"}
+        and spent <= config.max_cost_per_task_usd + 1e-12,
         "request_sha256": request_hashes,
         "api_calls": api_calls,
         "mcp_transcript": transcript,
+        "token_usage": _usage_totals(api_calls),
+        "tool_metrics": [
+            {
+                "name": name,
+                **{
+                    key: int(aggregate[key])
+                    for key in (
+                        "attempts",
+                        "dispatched",
+                        "successes",
+                        "errors",
+                        "invalid_arguments",
+                        "same_tool_successes_after_error",
+                    )
+                },
+                "latency_seconds": round(aggregate["latency_seconds"], 6),
+            }
+            for name, aggregate in sorted(tool_metrics.items())
+        ],
+        "first_model_response_seconds": (
+            None
+            if first_model_response_seconds is None
+            else round(first_model_response_seconds, 6)
+        ),
+        "inference_seconds": round(inference_seconds, 6),
+        "mcp_seconds": round(mcp_seconds, 6),
         "latency_seconds": round(time.monotonic() - started, 6),
     }

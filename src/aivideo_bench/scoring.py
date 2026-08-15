@@ -13,9 +13,9 @@ from statistics import mean
 from typing import Any
 
 
-SCORING_CONTRACT_VERSION = "v3-interpretable-additive-v5"
+SCORING_CONTRACT_VERSION = "v3-interpretable-additive-v6"
 SCORE_RELEASE_POLICY = (
-    "after_exact_stage_terminal_receipts_interpretable_additive_v5"
+    "after_terminal_receipts_cost_and_calibration_gates_interpretable_additive_v6"
 )
 QUALITY_WEIGHTS = {
     "critical": 0.60,

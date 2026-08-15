@@ -23,6 +23,7 @@ RESULT_ROW_KEYS = frozenset(
         "paid_media_credits",
     }
 )
+RESULT_REPORT_CONTRACT_VERSION = "aivideo-bench-result-report-v2-cost-gated"
 
 
 def _number(value: Any, *, label: str, minimum: float, maximum: float | None = None) -> float:
@@ -142,14 +143,25 @@ def summarize_results(
             for task_id, task in public_tasks.items()
             if task["domain"] == domain
         )
-    score_valid = invalid_count == 0 and paid_media == 0
+    score_valid = (
+        invalid_count == 0
+        and paid_media == 0
+        and cost_overrun_count == 0
+    )
+    if invalid_count or paid_media:
+        score_status = "invalid_execution"
+    elif cost_overrun_count:
+        score_status = "cost_gate_failed"
+    else:
+        score_status = "valid"
     cell_count = len(expected_cells)
     return {
         "model": model,
         "provider": provider,
+        "result_report_contract_version": RESULT_REPORT_CONTRACT_VERSION,
         "standard_version": public["standard_version"],
         "standard_sha256": public["standard_sha256"],
-        "score_status": "valid" if score_valid else "invalid_execution",
+        "score_status": score_status,
         "official_score": round(diagnostic_score, 6) if score_valid else None,
         "diagnostic_quality_score": round(diagnostic_score, 6),
         "score_maximum": 100.0,

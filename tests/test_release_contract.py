@@ -143,7 +143,9 @@ def test_cost_overrun_is_visible_without_erasing_verified_quality():
         _rows(over_cap=True), model="Luna", provider="Codex"
     )
 
-    assert summary["official_score"] == 50.0
+    assert summary["official_score"] is None
+    assert summary["diagnostic_quality_score"] == 50.0
+    assert summary["score_status"] == "cost_gate_failed"
     assert summary["cost"]["cap_respected"] is False
     assert summary["cost"]["over_cap_trials"] == 300
 

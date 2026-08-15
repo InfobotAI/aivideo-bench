@@ -113,6 +113,24 @@ Exactly 300 canonical rows are required. The report separates score, success,
 invalid executions, domain performance, inference cost, paid-media credits,
 and cost-cap compliance.
 
+## Company model decisions
+
+The 100-point score answers capability, not every business question. The
+company scorecard adds two separate evidence planes:
+
+- runtime economics: p50/p95 latency, decomposed tokens, inference cost per
+  usable success, tool reliability, same-tool success after errors, loops,
+  false completion, and human intervention;
+- business outcomes: denominator-backed adoption, exports, support, refunds,
+  upgrades, retention, rework, project loss, revenue, margin, and sales-demo
+  readiness with explicit observed/directional/causal claim levels.
+
+It intentionally does not invent an overall blended score. See
+[`docs/COMPANY_SCORECARD.md`](docs/COMPANY_SCORECARD.md) for the input contract
+and company comparison workflow. The behavior-first
+[`company explainer`](docs/COMPANY_EXPLAINER.md) describes the architecture,
+tradeoffs, evidence boundaries, and comprehension gate.
+
 ## Architecture
 
 ```text

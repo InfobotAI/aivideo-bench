@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from .company import build_company_report, metric_catalog, render_company_markdown
 from .mcp_client import StreamableHTTPConfig, StreamableHTTPMCPClient
 from .private_pack import validate_private_pack
 from .results import render_markdown, summarize_results
@@ -86,6 +87,31 @@ def _parser() -> argparse.ArgumentParser:
     report_command.add_argument("--format", choices=("markdown", "json"), default="markdown")
     report_command.add_argument("--output", type=Path)
 
+    company_command = commands.add_parser(
+        "company-report",
+        help="compare complete candidates across quality, speed, cost, tools, and business outcomes",
+    )
+    company_command.add_argument(
+        "--candidate",
+        type=Path,
+        action="append",
+        required=True,
+        help="candidate JSON; repeat for each model/configuration",
+    )
+    company_command.add_argument(
+        "--format", choices=("markdown", "json"), default="markdown"
+    )
+    company_command.add_argument(
+        "--manifest-signing-key-env",
+        default="AIVIDEO_BENCH_MANIFEST_SIGNING_KEY",
+    )
+    company_command.add_argument("--output", type=Path)
+
+    metrics_command = commands.add_parser(
+        "company-metrics", help="print the company business-question registry"
+    )
+    metrics_command.add_argument("--output", type=Path)
+
     snapshot_command = commands.add_parser(
         "mcp-snapshot",
         help="authenticate and snapshot the real MCP tool surface without tool calls",
@@ -130,6 +156,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _write_json(summary, args.output)
             else:
                 _write(render_markdown(summary), args.output)
+        elif args.command == "company-report":
+            manifest_key = os.environ.get(args.manifest_signing_key_env)
+            if manifest_key is None:
+                raise ValueError(
+                    "manifest signing key environment variable is unset: "
+                    f"{args.manifest_signing_key_env}"
+                )
+            report = build_company_report(
+                [_read_json(path) for path in args.candidate],
+                manifest_signing_key=manifest_key.encode(),
+            )
+            if args.format == "json":
+                _write_json(report, args.output)
+            else:
+                _write(render_company_markdown(report), args.output)
+        elif args.command == "company-metrics":
+            _write_json(metric_catalog(), args.output)
         elif args.command == "mcp-snapshot":
             token = os.environ.get(args.token_env)
             if token is None:
